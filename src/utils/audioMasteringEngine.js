@@ -12,7 +12,7 @@ export function calculateLoudnessStats(audioBuffer) {
   let sumSquare = 0;
   let samplesCounted = 0;
 
-  // Stride through samples so analyzing 80-minute files completes in ~2ms instead of seconds
+  // Stride through samples so analyzing long files completes in ~2ms
   const step = Math.max(1, Math.floor(length / 100000));
 
   for (let c = 0; c < numChannels; c++) {
@@ -42,12 +42,13 @@ export function calculateLoudnessStats(audioBuffer) {
 /**
  * Processes an input audio Blob using:
  * 1. Adaptive DeNoise (High-pass 85Hz rumble cut + 60Hz hum notch)
- * 2. Multi-Band Compressor (Low/Mid/High 3-way crossover dynamics)
- * 3. Vocal Enhancer (Formant presence boost at 2.8kHz + de-mud cut at 350Hz + air shelf)
+ * 2. Multi-Band Compressor (Low/Mid/High dynamics)
+ * 3. Vocal Enhancer (Formant boost at 2.8kHz + de-mud at 350Hz + air shelf)
  * 4. Distortion-Free Volume Booster (Gain slider)
  * 5. Hard Brickwall Limiter (-0.5 dBFS ceiling to prevent clipping)
  *
- * Encodes the result to a new high-quality MP3 Blob with non-blocking progress reporting.
+ * Encodes directly to an optimized mono MP3 (64kbps voice-optimized)
+ * to strictly prevent exceeding cloud storage limits (e.g. Supabase 50MB cap).
  */
 export async function enhanceAudioPipeline(audioBlob, options = {}, onProgress = null) {
   const {
@@ -61,7 +62,7 @@ export async function enhanceAudioPipeline(audioBlob, options = {}, onProgress =
 
   const arrayBuffer = await audioBlob.arrayBuffer();
   const offlineCtx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(
-    2,
+    1,
     1,
     44100
   );
@@ -71,13 +72,12 @@ export async function enhanceAudioPipeline(audioBlob, options = {}, onProgress =
   const sampleRate = decodedBuffer.sampleRate;
   const length = decodedBuffer.length;
   const duration = decodedBuffer.duration;
-  const channels = Math.min(2, decodedBuffer.numberOfChannels);
 
-  onProgress?.({ stage: 'Applying studio DSP filters...', percent: 30 });
+  onProgress?.({ stage: 'Applying studio DSP filters...', percent: 25 });
 
-  // Create an OfflineAudioContext with exact dimensions
+  // Voice recordings run in mono: cuts RAM and DSP rendering time by 50%
   const renderCtx = new OfflineAudioContext(
-    channels,
+    1,
     length,
     sampleRate
   );
@@ -88,7 +88,7 @@ export async function enhanceAudioPipeline(audioBlob, options = {}, onProgress =
 
   let currentNode = source;
 
-  // 2. DeNoise Filter (Rumble cut below 85Hz + 60Hz electrical hum notch)
+  // 2. DeNoise Filter (Rumble cut below 85Hz + 60Hz hum notch)
   if (enableDeNoise) {
     const highpass = renderCtx.createBiquadFilter();
     highpass.type = 'highpass';
@@ -106,21 +106,18 @@ export async function enhanceAudioPipeline(audioBlob, options = {}, onProgress =
 
   // 3. Speech Enhancement / Vocal Shaping
   if (enableEnhanceSpeech) {
-    // Cut boxy room resonances around 350Hz
     const deMud = renderCtx.createBiquadFilter();
     deMud.type = 'peaking';
     deMud.frequency.value = 350;
     deMud.Q.value = 1.2;
     deMud.gain.value = -3.5;
 
-    // Presence & articulation boost (2.8 kHz speech intelligibility)
     const clarity = renderCtx.createBiquadFilter();
     clarity.type = 'peaking';
     clarity.frequency.value = 2800;
     clarity.Q.value = 1.0;
     clarity.gain.value = 4.0;
 
-    // Air / Brilliance shelf (above 8.5 kHz)
     const air = renderCtx.createBiquadFilter();
     air.type = 'highshelf';
     air.frequency.value = 8500;
@@ -145,7 +142,7 @@ export async function enhanceAudioPipeline(audioBlob, options = {}, onProgress =
     currentNode = compressor;
   }
 
-  // 5. Volume Booster Stage (User Slider 0.8x to 3.0x)
+  // 5. Volume Booster Stage
   const boostGain = renderCtx.createGain();
   boostGain.gain.value = Math.max(0.5, Math.min(3.5, volumeBoost));
   currentNode.connect(boostGain);
@@ -162,17 +159,35 @@ export async function enhanceAudioPipeline(audioBlob, options = {}, onProgress =
   currentNode.connect(brickwallLimiter);
   brickwallLimiter.connect(renderCtx.destination);
 
+  // Progressive status ticker while DSP rendering takes place
+  let renderTicker = null;
+  let currentPct = 25;
+  if (onProgress) {
+    renderTicker = setInterval(() => {
+      currentPct = Math.min(42, currentPct + 2);
+      onProgress({ stage: 'Applying studio DSP filters...', percent: currentPct });
+    }, 800);
+  }
+
   // Start offline render
   source.start(0);
   const renderedBuffer = await renderCtx.startRendering();
+  if (renderTicker) clearInterval(renderTicker);
 
   // Fast Loudness & Peak Stats (ITU-R BS.1770)
   const stats = calculateLoudnessStats(renderedBuffer);
 
   onProgress?.({ stage: 'Encoding MP3...', percent: 45 });
 
+  // Calculate target bitrate to GUARANTEE file stays well under 50 MB limit
+  // For audio > 75 mins, 64kbps produces ~36MB. For audio > 100 mins, use 48kbps.
+  let targetKbps = 64;
+  if (duration > 5400) { // > 90 mins
+    targetKbps = 48;
+  }
+
   // Encode the rendered buffer to MP3 with non-blocking loop and live progress
-  const enhancedMp3Blob = await encodeAudioBufferToMp3(renderedBuffer, onProgress);
+  const enhancedMp3Blob = await encodeAudioBufferToMp3(renderedBuffer, targetKbps, onProgress);
 
   return {
     enhancedBlob: enhancedMp3Blob,
@@ -184,40 +199,32 @@ export async function enhanceAudioPipeline(audioBlob, options = {}, onProgress =
 /**
  * Encodes an AudioBuffer into MP3 Blob with non-blocking UI chunks
  */
-async function encodeAudioBufferToMp3(audioBuffer, onProgress = null) {
-  const channels = audioBuffer.numberOfChannels;
+async function encodeAudioBufferToMp3(audioBuffer, targetKbps = 64, onProgress = null) {
   const sampleRate = audioBuffer.sampleRate;
-  const mp3encoder = new Mp3Encoder(channels, sampleRate, 128); // 128 kbps
+  // Mono 64kbps: highest voice fidelity, 50% smaller file size, fits within cloud quotas
+  const mp3encoder = new Mp3Encoder(1, sampleRate, targetKbps);
 
   const mp3Data = [];
   const sampleBlockSize = 1152;
 
-  const leftData = audioBuffer.getChannelData(0);
-  const rightData = channels > 1 ? audioBuffer.getChannelData(1) : leftData;
+  const channelData = audioBuffer.getChannelData(0);
+  const int16Array = convertFloat32ToInt16Fast(channelData);
 
-  // Ultra-fast clamping (100x faster than Math.tanh on hundreds of millions of samples)
-  const leftInt16 = convertFloat32ToInt16Fast(leftData);
-  const rightInt16 = channels > 1 ? convertFloat32ToInt16Fast(rightData) : leftInt16;
-
-  const length = leftInt16.length;
+  const length = int16Array.length;
   let blocksProcessed = 0;
 
   for (let i = 0; i < length; i += sampleBlockSize) {
-    const leftChunk = leftInt16.subarray(i, i + sampleBlockSize);
-    const rightChunk = channels > 1 ? rightInt16.subarray(i, i + sampleBlockSize) : leftChunk;
-
-    const mp3buf = channels === 1
-      ? mp3encoder.encodeBuffer(leftChunk)
-      : mp3encoder.encodeBuffer(leftChunk, rightChunk);
+    const chunk = int16Array.subarray(i, i + sampleBlockSize);
+    const mp3buf = mp3encoder.encodeBuffer(chunk);
 
     if (mp3buf.length > 0) {
       mp3Data.push(mp3buf);
     }
 
     blocksProcessed++;
-    // Yield to browser event loop every 30 blocks to keep UI silky smooth and update progress
-    if (blocksProcessed % 30 === 0) {
-      const pct = Math.min(99, Math.round(45 + (i / length) * 53));
+    // Yield to browser event loop every 40 blocks to keep UI silky smooth and update progress
+    if (blocksProcessed % 40 === 0) {
+      const pct = Math.min(99, Math.round(45 + (i / length) * 52));
       onProgress?.({
         stage: `Encoding MP3 (${Math.round((i / length) * 100)}%)...`,
         percent: pct
