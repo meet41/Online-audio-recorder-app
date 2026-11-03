@@ -1,7 +1,6 @@
 import { supabase, isSupabaseConfigured } from '../supabase';
 
 const LOCAL_STORAGE_KEY = 'offline_audio_recordings_cache_v3';
-const COMMENTS_STORAGE_KEY = 'offline_comments_cache_v1';
 
 function getLocalRecordings() {
   try {
@@ -17,23 +16,6 @@ function saveLocalRecordings(items) {
     localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(items));
   } catch (e) {
     console.warn('Storage full or error saving to localStorage', e);
-  }
-}
-
-function getLocalComments() {
-  try {
-    const raw = localStorage.getItem(COMMENTS_STORAGE_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch (e) {
-    return [];
-  }
-}
-
-function saveLocalComments(items) {
-  try {
-    localStorage.setItem(COMMENTS_STORAGE_KEY, JSON.stringify(items));
-  } catch (e) {
-    console.warn('Storage full or error saving comments', e);
   }
 }
 
@@ -95,35 +77,83 @@ function normalizeRecord(item) {
     isDeleted: Boolean(item.is_deleted ?? item.isDeleted),
     deletedAt: item.deleted_at || item.deletedAt,
     createdAt: item.created_at || item.createdAt || new Date().toISOString(),
-    likes: Array.isArray(item.likes) ? item.likes : [],
-    playCount: item.play_count || item.playCount || 0,
-    parentId: item.parent_id || item.parentId || null,
   };
 }
 
 /**
- * Upload MP3 and publish to the global social feed
+ * Helper to upload a file with real-time XMLHttpRequest progress (0% - 100%)
  */
-export async function createRecording({ audioBlob, name, author, duration, size, parentId = null }) {
-  const fileName = `audio_${Date.now()}_${Math.random().toString(36).substring(2, 8)}.mp3`;
+function uploadToSupabaseWithProgress({ supabaseUrl, anonKey, bucket, path, fileBlob, contentType, onProgress }) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const endpoint = `${supabaseUrl}/storage/v1/object/${bucket}/${path}`;
+
+    xhr.open('POST', endpoint, true);
+    xhr.setRequestHeader('apikey', anonKey);
+    xhr.setRequestHeader('Authorization', `Bearer ${anonKey}`);
+    xhr.setRequestHeader('Content-Type', contentType || 'audio/mpeg');
+    xhr.setRequestHeader('x-upsert', 'false');
+
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && onProgress) {
+        const percent = Math.min(100, Math.round((event.loaded / event.total) * 100));
+        onProgress(percent);
+      }
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(JSON.parse(xhr.responseText || '{}'));
+      } else {
+        reject(new Error(`Storage upload error (${xhr.status}): ${xhr.responseText}`));
+      }
+    };
+
+    xhr.onerror = () => reject(new Error('Network error during upload'));
+    xhr.send(fileBlob);
+  });
+}
+
+/**
+ * Upload audio blob to Supabase Storage and insert metadata with live progress callback
+ */
+export async function createRecording({ audioBlob, name, author, duration, size, onProgress = null }) {
+  // Determine file extension
+  let ext = 'mp3';
+  if (audioBlob.type.includes('m4a') || audioBlob.type.includes('mp4')) ext = 'm4a';
+  else if (audioBlob.type.includes('wav')) ext = 'wav';
+  else if (audioBlob.type.includes('ogg')) ext = 'ogg';
+  else if (audioBlob.type.includes('webm')) ext = 'webm';
+
+  const fileName = `audio_${Date.now()}_${Math.random().toString(36).substring(2, 8)}.${ext}`;
 
   if (isSupabaseConfigured && supabase) {
-    const { error: uploadError } = await supabase.storage
-      .from('recordings')
-      .upload(fileName, audioBlob, {
-        contentType: 'audio/mp3',
-        cacheControl: '3600',
-        upsert: false,
-      });
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+    const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
-    if (uploadError) throw new Error(`Upload failed: ${uploadError.message}`);
+    // 1. Upload with real-time progress
+    await uploadToSupabaseWithProgress({
+      supabaseUrl,
+      anonKey,
+      bucket: 'recordings',
+      path: fileName,
+      fileBlob: audioBlob,
+      contentType: audioBlob.type || 'audio/mpeg',
+      onProgress: (percent) => {
+        if (onProgress) onProgress({ stage: 'upload', percent });
+      }
+    });
 
+    // 2. Get Public URL
     const { data: urlData } = supabase.storage
       .from('recordings')
       .getPublicUrl(fileName);
 
     const publicAudioUrl = urlData.publicUrl;
 
+    if (onProgress) onProgress({ stage: 'saving', percent: 100 });
+
+    // 3. Insert metadata into PostgreSQL
     const { data, error: insertError } = await supabase
       .from('recordings')
       .insert([
@@ -136,18 +166,21 @@ export async function createRecording({ audioBlob, name, author, duration, size,
           storage_path: fileName,
           is_deleted: false,
           deleted_at: null,
-          likes: [],
-          play_count: 0,
-          parent_id: parentId,
         },
       ])
       .select()
       .single();
 
-    if (insertError) throw new Error(`Publish failed: ${insertError.message}`);
+    if (insertError) throw new Error(`Database save error: ${insertError.message}`);
 
     return normalizeRecord(data);
   } else {
+    // Offline local fallback
+    if (onProgress) {
+      onProgress({ stage: 'upload', percent: 50 });
+      setTimeout(() => onProgress({ stage: 'saving', percent: 100 }), 300);
+    }
+
     return new Promise((resolve) => {
       const reader = new FileReader();
       reader.onloadend = () => {
@@ -163,9 +196,6 @@ export async function createRecording({ audioBlob, name, author, duration, size,
           isDeleted: false,
           deletedAt: null,
           createdAt: new Date().toISOString(),
-          likes: [],
-          playCount: 0,
-          parentId,
         };
 
         const existing = getLocalRecordings();
@@ -175,125 +205,6 @@ export async function createRecording({ audioBlob, name, author, duration, size,
       };
       reader.readAsDataURL(audioBlob);
     });
-  }
-}
-
-/**
- * Toggle Like on a recording (Social interaction)
- */
-export async function toggleLikeRecording(id, username) {
-  if (isSupabaseConfigured && supabase) {
-    const { data: current } = await supabase
-      .from('recordings')
-      .select('likes')
-      .eq('id', id)
-      .single();
-
-    let currentLikes = current?.likes || [];
-    if (currentLikes.includes(username)) {
-      currentLikes = currentLikes.filter((u) => u !== username);
-    } else {
-      currentLikes = [...currentLikes, username];
-    }
-
-    await supabase
-      .from('recordings')
-      .update({ likes: currentLikes })
-      .eq('id', id);
-  } else {
-    const list = getLocalRecordings();
-    const updated = list.map((item) => {
-      if (item.id === id) {
-        const currentLikes = item.likes || [];
-        const newLikes = currentLikes.includes(username)
-          ? currentLikes.filter((u) => u !== username)
-          : [...currentLikes, username];
-        return { ...item, likes: newLikes };
-      }
-      return item;
-    });
-    saveLocalRecordings(updated);
-  }
-}
-
-/**
- * Increment play count
- */
-export async function incrementPlayCount(id) {
-  if (isSupabaseConfigured && supabase) {
-    const { data } = await supabase.from('recordings').select('play_count').eq('id', id).single();
-    const newCount = (data?.play_count || 0) + 1;
-    await supabase.from('recordings').update({ play_count: newCount }).eq('id', id);
-  } else {
-    const list = getLocalRecordings();
-    const updated = list.map((item) =>
-      item.id === id ? { ...item, playCount: (item.playCount || 0) + 1 } : item
-    );
-    saveLocalRecordings(updated);
-  }
-}
-
-/**
- * Subscribe to comments for a recording
- */
-export function subscribeToComments(recordingId, callback) {
-  if (isSupabaseConfigured && supabase) {
-    const fetchComments = async () => {
-      const { data } = await supabase
-        .from('recording_comments')
-        .select('*')
-        .eq('recording_id', recordingId)
-        .order('created_at', { ascending: true });
-
-      callback(data || []);
-    };
-
-    fetchComments();
-
-    const channel = supabase
-      .channel(`comments_${recordingId}`)
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'recording_comments', filter: `recording_id=eq.${recordingId}` },
-        () => {
-          fetchComments();
-        }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  } else {
-    const all = getLocalComments();
-    const filtered = all.filter((c) => c.recording_id === recordingId);
-    callback(filtered);
-    return () => {};
-  }
-}
-
-/**
- * Post a comment
- */
-export async function addComment(recordingId, author, text) {
-  if (isSupabaseConfigured && supabase) {
-    await supabase.from('recording_comments').insert([
-      {
-        recording_id: recordingId,
-        author,
-        text,
-      },
-    ]);
-  } else {
-    const all = getLocalComments();
-    const newComment = {
-      id: `comment_${Date.now()}`,
-      recording_id: recordingId,
-      author,
-      text,
-      created_at: new Date().toISOString(),
-    };
-    saveLocalComments([...all, newComment]);
   }
 }
 

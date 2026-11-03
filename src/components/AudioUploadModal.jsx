@@ -9,6 +9,8 @@ export default function AudioUploadModal({ isOpen, onClose, username, existingRe
   const [duration, setDuration] = useState(0);
   const [audioUrl, setAudioUrl] = useState(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processingStatus, setProcessingStatus] = useState('');
+  const [uploadPercent, setUploadPercent] = useState(0);
   const [errorMsg, setErrorMsg] = useState('');
   const [dragOver, setDragOver] = useState(false);
 
@@ -16,10 +18,16 @@ export default function AudioUploadModal({ isOpen, onClose, username, existingRe
 
   if (!isOpen) return null;
 
-  const handleFileSelect = async (file) => {
+  const handleFileSelect = (file) => {
     if (!file) return;
 
-    if (!file.type.startsWith('audio/') && !file.name.match(/\.(mp3|wav|ogg|m4a|aac|webm)$/i)) {
+    const MAX_SIZE_BYTES = 50 * 1024 * 1024; // 50 MB
+    if (file.size > MAX_SIZE_BYTES) {
+      setErrorMsg(`File is too large (${formatBytes(file.size)}). Max allowed is 50 MB.`);
+      return;
+    }
+
+    if (!file.type.startsWith('audio/') && !file.name.match(/\.(mp3|wav|ogg|m4a|aac|webm|flac)$/i)) {
       setErrorMsg('Please upload a valid audio file (.mp3, .wav, .m4a, .ogg, .webm)');
       return;
     }
@@ -27,16 +35,15 @@ export default function AudioUploadModal({ isOpen, onClose, username, existingRe
     setErrorMsg('');
     setSelectedFile(file);
 
-    // Default name based on username & date convention
     const defaultName = generateDefaultRecordingName(username, existingRecordings);
     setCustomName(defaultName);
 
-    // Create temporary URL to read duration and preview
     const tempUrl = URL.createObjectURL(file);
     setAudioUrl(tempUrl);
 
-    // Extract duration from audio element
-    const tempAudio = new Audio(tempUrl);
+    const tempAudio = new Audio();
+    tempAudio.preload = 'metadata';
+    tempAudio.src = tempUrl;
     tempAudio.onloadedmetadata = () => {
       if (tempAudio.duration && !isNaN(tempAudio.duration) && tempAudio.duration !== Infinity) {
         setDuration(Math.round(tempAudio.duration));
@@ -60,6 +67,8 @@ export default function AudioUploadModal({ isOpen, onClose, username, existingRe
     setDuration(0);
     setErrorMsg('');
     setIsProcessing(false);
+    setProcessingStatus('');
+    setUploadPercent(0);
     onClose();
   };
 
@@ -68,26 +77,60 @@ export default function AudioUploadModal({ isOpen, onClose, username, existingRe
 
     setIsProcessing(true);
     setErrorMsg('');
+    setUploadPercent(0);
 
     try {
       let finalBlob = selectedFile;
+      const fileNameLower = selectedFile.name.toLowerCase();
 
-      // If uploaded file is not already MP3, encode to standard MP3
-      if (selectedFile.type !== 'audio/mp3' && !selectedFile.name.endsWith('.mp3')) {
+      // Check for Instant Pass-through:
+      // ALL standard pre-encoded audio formats (.mp3, .m4a, .aac, .ogg, .webm, .flac)
+      // are passed directly to the cloud without re-encoding!
+      const isPreEncodedFormat =
+        fileNameLower.endsWith('.mp3') ||
+        fileNameLower.endsWith('.m4a') ||
+        fileNameLower.endsWith('.aac') ||
+        fileNameLower.endsWith('.ogg') ||
+        fileNameLower.endsWith('.webm') ||
+        fileNameLower.endsWith('.flac') ||
+        selectedFile.type.includes('mpeg') ||
+        selectedFile.type.includes('mp4') ||
+        selectedFile.type.includes('ogg') ||
+        selectedFile.type.includes('webm');
+
+      if (isPreEncodedFormat) {
+        setProcessingStatus('Instant Pass-through: Uploading directly...');
+        finalBlob = selectedFile;
+      } else {
+        // Raw WAV or uncompressed audio: Fast 64kbps stream encode
+        setProcessingStatus('Encoding to 64kbps MP3...');
         try {
-          finalBlob = await convertAudioBlobToMp3(selectedFile);
+          finalBlob = await convertAudioBlobToMp3(selectedFile, (encPercent) => {
+            setProcessingStatus(`Encoding audio: ${encPercent}%`);
+          });
         } catch (convErr) {
-          console.warn('Direct MP3 conversion failed, using original audio blob', convErr);
+          console.warn('Encoder bypass, uploading directly:', convErr);
           finalBlob = selectedFile;
         }
       }
 
+      setProcessingStatus('Uploading to Cloud: 0%');
+
+      // Live upload progress to Supabase
       await onUpload({
         audioBlob: finalBlob,
         name: customName.trim() || generateDefaultRecordingName(username, existingRecordings),
         author: username,
         duration: duration || 0,
         size: finalBlob.size,
+        onProgress: ({ stage, percent }) => {
+          setUploadPercent(percent);
+          if (stage === 'upload') {
+            setProcessingStatus(`Uploading to Cloud: ${percent}%`);
+          } else {
+            setProcessingStatus('Finalizing & Saving...');
+          }
+        }
       });
 
       cleanup();
@@ -95,6 +138,7 @@ export default function AudioUploadModal({ isOpen, onClose, username, existingRe
       console.error('Upload failed:', err);
       setErrorMsg('Upload failed: ' + err.message);
       setIsProcessing(false);
+      setProcessingStatus('');
     }
   };
 
@@ -109,7 +153,7 @@ export default function AudioUploadModal({ isOpen, onClose, username, existingRe
             </div>
             <div>
               <h2 className="text-base font-bold text-slate-800 leading-tight">Upload Audio File</h2>
-              <p className="text-xs text-slate-500">Supports MP3, WAV, M4A, OGG, WebM</p>
+              <p className="text-xs text-slate-500">Instant Pass-through (.mp3, .m4a, .ogg, .webm)</p>
             </div>
           </div>
           <button
@@ -147,7 +191,7 @@ export default function AudioUploadModal({ isOpen, onClose, username, existingRe
             <input
               type="file"
               ref={fileInputRef}
-              accept="audio/*,.mp3,.wav,.ogg,.m4a,.aac,.webm"
+              accept="audio/*,.mp3,.wav,.ogg,.m4a,.aac,.webm,.flac"
               className="hidden"
               onChange={(e) => handleFileSelect(e.target.files?.[0])}
             />
@@ -157,7 +201,7 @@ export default function AudioUploadModal({ isOpen, onClose, username, existingRe
             <p className="text-sm font-semibold text-slate-700">
               Click to select or drag & drop audio here
             </p>
-            <p className="text-xs text-slate-400 mt-1">Maximum file size 50 MB</p>
+            <p className="text-xs text-slate-400 mt-1">Instant upload for MP3, M4A, OGG, WebM</p>
           </div>
         ) : (
           <div className="mt-5 space-y-4">
@@ -174,16 +218,18 @@ export default function AudioUploadModal({ isOpen, onClose, username, existingRe
                   </p>
                 </div>
               </div>
-              <button
-                onClick={() => {
-                  setSelectedFile(null);
-                  if (audioUrl) URL.revokeObjectURL(audioUrl);
-                  setAudioUrl(null);
-                }}
-                className="text-xs text-rose-600 hover:text-rose-700 font-medium ml-2 px-2 py-1 rounded-lg hover:bg-rose-50"
-              >
-                Change
-              </button>
+              {!isProcessing && (
+                <button
+                  onClick={() => {
+                    setSelectedFile(null);
+                    if (audioUrl) URL.revokeObjectURL(audioUrl);
+                    setAudioUrl(null);
+                  }}
+                  className="text-xs text-rose-600 hover:text-rose-700 font-medium ml-2 px-2 py-1 rounded-lg hover:bg-rose-50"
+                >
+                  Change
+                </button>
+              )}
             </div>
 
             {/* Custom name input */}
@@ -194,14 +240,31 @@ export default function AudioUploadModal({ isOpen, onClose, username, existingRe
               <input
                 type="text"
                 value={customName}
+                disabled={isProcessing}
                 onChange={(e) => setCustomName(e.target.value)}
-                className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 disabled:opacity-60"
                 placeholder="Recording name..."
               />
             </div>
 
+            {/* Live Progress Bar during Processing / Upload */}
+            {isProcessing && (
+              <div className="pt-2">
+                <div className="flex justify-between text-xs text-slate-600 font-medium mb-1.5">
+                  <span>{processingStatus}</span>
+                  <span className="font-mono text-indigo-600 font-bold">{uploadPercent}%</span>
+                </div>
+                <div className="w-full bg-slate-100 rounded-full h-2.5 overflow-hidden">
+                  <div
+                    className="bg-indigo-600 h-2.5 rounded-full transition-all duration-200 ease-out"
+                    style={{ width: `${uploadPercent}%` }}
+                  ></div>
+                </div>
+              </div>
+            )}
+
             {/* Audio Preview */}
-            {audioUrl && (
+            {!isProcessing && audioUrl && (
               <div className="pt-2">
                 <audio controls src={audioUrl} className="w-full h-10 rounded-lg accent-indigo-600" />
               </div>
@@ -226,7 +289,7 @@ export default function AudioUploadModal({ isOpen, onClose, username, existingRe
             {isProcessing ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
-                <span>Uploading...</span>
+                <span>Processing...</span>
               </>
             ) : (
               <>

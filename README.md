@@ -1,3 +1,6 @@
+<<<<<<< HEAD
+# Online-audio-recorder-app
+=======
 # Voice Memos Cloud - Online Recording CRUD
 
 A modern, responsive, voice recording and sharing web application designed with the Voice Memos / Pixel Recorder mobile aesthetic.
@@ -106,3 +109,4 @@ Visit the displayed local URL (usually `http://localhost:5173`).
 2. Import project into Vercel or Netlify.
 3. Add the `VITE_FIREBASE_*` environment variables in their dashboard.
 4. Auto-deploys for free with global CDN and SSL.
+>>>>>>> df4f7fd (feat: Audio recorder app)
