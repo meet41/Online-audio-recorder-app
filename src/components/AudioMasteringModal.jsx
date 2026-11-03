@@ -288,7 +288,7 @@ export default function AudioMasteringModal({ isOpen, onClose, recording, onSave
         }
       );
 
-      setSaveStatus('Saving to cloud...');
+      setSaveStatus('Uploading to cloud...');
       const newName = `${recording.name} (Enhanced Studio)`;
 
       await onSaveEnhanced({
@@ -296,14 +296,21 @@ export default function AudioMasteringModal({ isOpen, onClose, recording, onSave
         name: newName,
         author: recording.author,
         duration: result.duration || recording.duration,
-        size: result.enhancedBlob.size
+        size: result.enhancedBlob.size,
+        onProgress: ({ stage, percent }) => {
+          if (stage === 'upload') {
+            setSaveStatus(`Uploading to cloud (${percent}%)...`);
+          } else {
+            setSaveStatus('Saving recording to database...');
+          }
+        }
       });
 
       cleanup();
       onClose();
     } catch (err) {
       console.error('Save enhanced error:', err);
-      alert('Error saving enhanced audio. Please try again.');
+      alert(`Error saving enhanced audio: ${err.message || 'Please check your connection and try again.'}`);
       setIsSaving(false);
     }
   };
